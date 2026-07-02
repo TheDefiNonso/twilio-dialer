@@ -4,10 +4,12 @@
   "description": "Backend for floating PiP dialer overlay (Twilio Voice SDK)",
   "main": "server.js",
   "scripts": {
+    "postinstall": "node -e \"require('fs').copyFileSync('node_modules/@twilio/voice-sdk/dist/twilio.min.js', 'public/twilio.min.js')\"",
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@twilio/voice-sdk": "^2.16.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "twilio": "^5.3.0"
