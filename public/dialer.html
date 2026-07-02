@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>CRM Dialer</title>
+<script src="https://sdk.twilio.com/js/voice/releases/2.11.1/twilio.min.js"></script>
+<style>
+  :root {
+    --bg: #111318;
+    --panel: #1b1e26;
+    --accent: #FFDE59;
+    --accent-dim: #a8951f;
+    --text: #f2f2f2;
+    --muted: #8a8f9c;
+    --danger: #e5484d;
+    --success: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  #app { padding: 16px; max-width: 340px; }
+  #dialer {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  h1 {
+    font-size: 14px;
+    margin: 0;
+    color: var(--accent);
+    letter-spacing: 0.02em;
+  }
+  #status {
+    font-size: 13px;
+    color: var(--muted);
+    padding: 6px 10px;
+    background: #0000;
+    border: 1px solid #2a2e38;
+    border-radius: 8px;
+  }
+  #status.ready { color: var(--success); }
+  #status.active { color: var(--accent); border-color: var(--accent-dim); }
+  #status.error { color: var(--danger); }
+  input[type="tel"] {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #2a2e38;
+    background: #0f1116;
+    color: var(--text);
+    font-size: 15px;
+  }
+  .row { display: flex; gap: 8px; }
+  button {
+    flex: 1;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #callBtn { background: var(--accent); color: #14151a; }
+  #callBtn:disabled { background: #3a3d46; color: var(--muted); cursor: not-allowed; }
+  #hangupBtn { background: var(--danger); color: #fff; }
+  #hangupBtn:disabled { background: #3a3d46; color: var(--muted); cursor: not-allowed; }
+  #pipBtn {
+    background: transparent;
+    border: 1px solid #2a2e38;
+    color: var(--muted);
+  }
+  #pipBtn:hover { border-color: var(--accent-dim); color: var(--accent); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="dialer">
+    <h1>CRM Dialer</h1>
+    <div id="status">Loading…</div>
+    <input id="number" type="tel" placeholder="+1 555 123 4567" autocomplete="off" />
+    <div class="row">
+      <button id="callBtn" disabled>Call</button>
+      <button id="hangupBtn" disabled>Hang up</button>
+    </div>
+    <button id="pipBtn">Pop out floating window</button>
+    <div id="autofillNote" class="hidden" style="font-size:12px;color:var(--muted);">Number loaded from Airtable — click Call to dial.</div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------
+// Give each rep a stable identity so calls/logs are attributable.
+// Swap this for something pulled from your CRM's logged-in user.
+const IDENTITY = new URLSearchParams(location.search).get('identity') || 'agent';
+
+const statusEl = document.getElementById('status');
+const numberEl = document.getElementById('number');
+const callBtn = document.getElementById('callBtn');
+const hangupBtn = document.getElementById('hangupBtn');
+const pipBtn = document.getElementById('pipBtn');
+
+let device;
+let activeCall;
+
+function setStatus(text, mode) {
+  statusEl.textContent = text;
+  statusEl.className = mode || '';
+}
+
+function setCallingUI(inCall) {
+  callBtn.disabled = inCall || !device;
+  hangupBtn.disabled = !inCall;
+  numberEl.disabled = inCall;
+}
+
+// ---------------------------------------------------------------
+// Twilio Device setup
+// ---------------------------------------------------------------
+async function initDevice() {
+  setStatus('Fetching token…');
+  const res = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
+  if (!res.ok) {
+    setStatus('Token request failed', 'error');
+    return;
+  }
+  const { token } = await res.json();
+
+  device = new Twilio.Device(token, {
+    codecPreferences: ['opus', 'pcmu'],
+  });
+
+  device.on('registered', () => {
+    setStatus('Ready', 'ready');
+    setCallingUI(false);
+  });
+
+  device.on('error', (err) => {
+    console.error('Twilio Device error:', err);
+    setStatus(`Error: ${err.message}`, 'error');
+  });
+
+  // Refresh the token before it expires (tokens are minted with a 1hr TTL)
+  device.on('tokenWillExpire', async () => {
+    const r = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
+    const { token: newToken } = await r.json();
+    device.updateToken(newToken);
+  });
+
+  device.on('incoming', (call) => {
+    // If you enable inbound browser calls later, handle ringing UI here.
+    setStatus(`Incoming: ${call.parameters.From}`, 'active');
+    activeCall = call;
+    wireCallEvents(call);
+    call.accept(); // or show accept/reject buttons instead of auto-accept
+  });
+
+  await device.register();
+}
+
+function wireCallEvents(call) {
+  call.on('ringing', () => setStatus('Ringing…', 'active'));
+  call.on('accept', () => {
+    setStatus('On call', 'active');
+    setCallingUI(true);
+  });
+  call.on('disconnect', () => {
+    setStatus('Ready', 'ready');
+    setCallingUI(false);
+    activeCall = null;
+  });
+  call.on('cancel', () => {
+    setStatus('Call canceled', 'ready');
+    setCallingUI(false);
+    activeCall = null;
+  });
+  call.on('reject', () => {
+    setStatus('Call rejected', 'ready');
+    setCallingUI(false);
+    activeCall = null;
+  });
+  call.on('error', (err) => {
+    console.error('Call error:', err);
+    setStatus(`Call error: ${err.message}`, 'error');
+    setCallingUI(false);
+    activeCall = null;
+  });
+}
+
+async function makeCall(numberOverride) {
+  if (!device) return;
+  const to = (numberOverride || numberEl.value).trim();
+  if (!to) return;
+
+  numberEl.value = to;
+  setStatus(`Calling ${to}…`, 'active');
+  activeCall = await device.connect({ params: { To: to } });
+  wireCallEvents(activeCall);
+}
+
+function hangUp() {
+  if (activeCall) activeCall.disconnect();
+}
+
+callBtn.addEventListener('click', () => makeCall());
+hangupBtn.addEventListener('click', hangUp);
+numberEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !callBtn.disabled) makeCall();
+});
+
+// ---------------------------------------------------------------
+// CRM click-to-call hook
+// ---------------------------------------------------------------
+// From your CRM page (same origin), you can trigger a call directly:
+//   document.getElementById('dialerFrame').contentWindow.dialerCall('+15551234567')
+// if this page is embedded in an iframe, or just call window.dialerCall(...)
+// if it's loaded in the same document/tab.
+window.dialerCall = (number) => makeCall(number);
+
+// ---------------------------------------------------------------
+// Document Picture-in-Picture: pop the dialer into a floating window
+// that stays on top while the rep works in the CRM tab.
+// ---------------------------------------------------------------
+const dialerEl = document.getElementById('dialer');
+let pipWindow = null;
+
+pipBtn.addEventListener('click', async () => {
+  if (!('documentPictureInPicture' in window)) {
+    alert('Floating window needs Chrome or Edge 116+. Not supported in this browser.');
+    return;
+  }
+  if (pipWindow) return; // already popped out
+
+  pipWindow = await window.documentPictureInPicture.requestWindow({
+    width: 300,
+    height: 260,
+  });
+
+  // Copy current stylesheets into the PiP window so it isn't unstyled
+  [...document.styleSheets].forEach((styleSheet) => {
+    try {
+      const cssText = [...styleSheet.cssRules].map((r) => r.cssText).join('\n');
+      const style = document.createElement('style');
+      style.textContent = cssText;
+      pipWindow.document.head.appendChild(style);
+    } catch (e) {
+      // Cross-origin stylesheet — link it instead
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.type = styleSheet.type;
+      link.media = styleSheet.media;
+      link.href = styleSheet.href;
+      pipWindow.document.head.appendChild(link);
+    }
+  });
+  pipWindow.document.body.style.margin = '0';
+  pipWindow.document.body.style.background = 'var(--bg)';
+
+  // Move the actual dialer DOM node into the PiP window.
+  // Note: this doesn't create a new JS context — `device`, `activeCall`,
+  // and all the event listeners above keep working exactly as before.
+  pipWindow.document.body.appendChild(dialerEl);
+  pipBtn.classList.add('hidden'); // pop-out button doesn't make sense once popped out
+
+  // When the user closes the PiP window, move the dialer back
+  pipWindow.addEventListener('pagehide', () => {
+    document.getElementById('app').appendChild(dialerEl);
+    pipBtn.classList.remove('hidden');
+    pipWindow = null;
+  });
+});
+
+// ---------------------------------------------------------------
+// Airtable button integration: read ?number=+15551234567 from the URL
+// (and optional &autodial=1 to skip the manual click).
+// Airtable Button field formula example:
+//   "https://your-dialer.app/dialer.html?identity=marc&number=" & ENCODE_URL_COMPONENT({Phone})
+// ---------------------------------------------------------------
+function applyUrlParams() {
+  const params = new URLSearchParams(location.search);
+  const number = params.get('number');
+  const autodial = params.get('autodial') === '1';
+
+  if (number) {
+    numberEl.value = number;
+    document.getElementById('autofillNote').classList.remove('hidden');
+
+    if (autodial) {
+      // Wait for the device to be ready before dialing automatically.
+      const tryAutoDial = setInterval(() => {
+        if (device && !callBtn.disabled) {
+          clearInterval(tryAutoDial);
+          makeCall(number);
+        }
+      }, 300);
+      // Give up after 10s so it doesn't spin forever if the device never registers
+      setTimeout(() => clearInterval(tryAutoDial), 10000);
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+initDevice();
+applyUrlParams();
+</script>
+</body>
+</html>
