@@ -119,8 +119,11 @@ app.post('/voice', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Bare root URL redirects to the actual dialer page
-app.get('/', (req, res) => res.redirect('/dialer.html'));
+// Bare root URL redirects to the actual dialer page, preserving any query string
+app.get('/', (req, res) => {
+  const qs = req.url.split('?')[1];
+  res.redirect(qs ? `/dialer.html?${qs}` : '/dialer.html');
+});
 
 app.listen(PORT, () => {
   console.log(`Dialer backend listening on port ${PORT}`);

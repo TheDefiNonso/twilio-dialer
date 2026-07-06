@@ -33,7 +33,8 @@
       max-width: 340px;
     }
 
-    #dialer {
+    #dialer,
+    #relayPanel {
       background: var(--panel);
       border-radius: 12px;
       padding: 16px;
@@ -167,6 +168,12 @@
 
 <body>
   <div id="app">
+    <div id="relayScreen" class="hidden">
+      <div id="relayPanel">
+        <h1>CRM Dialer</h1>
+        <div id="relayStatus">Sending number to your dialer…</div>
+      </div>
+    </div>
     <div id="dialer">
       <h1>CRM Dialer</h1>
       <div id="status">Loading…</div>
@@ -204,273 +211,341 @@
     // ---------------------------------------------------------------
     // Config
     // ---------------------------------------------------------------
-    // Give each rep a stable identity so calls/logs are attributable.
-    // Swap this for something pulled from your CRM's logged-in user.
     const IDENTITY = new URLSearchParams(location.search).get('identity') || '';
 
-    const statusEl = document.getElementById('status');
-    const numberEl = document.getElementById('number');
-    const callBtn = document.getElementById('callBtn');
-    const hangupBtn = document.getElementById('hangupBtn');
-    const pipBtn = document.getElementById('pipBtn');
-    const keypadEl = document.getElementById('keypad');
+    // Same-origin tabs/windows for the same rep can talk to each other over
+    // this channel. Used so an Airtable-launched tab can hand a number off
+    // to an already-open dialer (including a popped-out PiP window) instead
+    // of becoming a second, separate dialer instance.
+    const dialChannel = IDENTITY ? new BroadcastChannel(`dialer-${IDENTITY}`) : null;
 
     // ---------------------------------------------------------------
-    // DTMF (touch-tone) sending — for IVR menus like "press 1 for sales"
+    // Relay mode: this tab's only job is to pass a number to an existing
+    // dialer, then close itself. Triggered by &relay=1 in the URL — this is
+    // what Airtable's button links to, so clicking a lead's number doesn't
+    // open a second dialer, it just feeds the one you already have open.
     // ---------------------------------------------------------------
-    const VALID_DIGITS = new Set(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#']);
+    const params = new URLSearchParams(location.search);
+    const isRelay = params.get('relay') === '1';
 
-    function sendDigit(digit, sourceBtn) {
-      if (!activeCall) return;
-      activeCall.sendDigits(digit);
-      if (sourceBtn) {
-        sourceBtn.classList.add('flash');
-        setTimeout(() => sourceBtn.classList.remove('flash'), 150);
-      }
+    if (isRelay) {
+      runRelayMode();
     }
 
-    document.querySelectorAll('.keypadBtn').forEach((btn) => {
-      btn.addEventListener('click', () => sendDigit(btn.dataset.digit, btn));
-    });
-
-    // Keyboard capture: while a call is active, typing a digit anywhere on the
-    // page (except while focused in the number input) sends that DTMF tone —
-    // no need to click anything, just type like you would on a real phone.
-    window.addEventListener('keydown', (e) => {
-      if (!activeCall) return;
-      if (document.activeElement === numberEl) return; // don't hijack typing a new number
-      if (!VALID_DIGITS.has(e.key)) return;
-
-      e.preventDefault();
-      const matchingBtn = document.querySelector(`.keypadBtn[data-digit="${e.key}"]`);
-      sendDigit(e.key, matchingBtn);
-    });
-
-    let device;
-    let activeCall;
-
-    function setStatus(text, mode) {
-      statusEl.textContent = text;
-      statusEl.className = mode || '';
-    }
-
-    function setCallingUI(inCall) {
-      callBtn.disabled = inCall || !device;
-      hangupBtn.disabled = !inCall;
-      numberEl.disabled = inCall;
-    }
-
-    // ---------------------------------------------------------------
-    // Twilio Device setup
-    // ---------------------------------------------------------------
-    async function initDevice() {
-      try {
-        if (!IDENTITY) {
-          setStatus('No identity in URL — add ?identity=yourname', 'error');
-          return;
-        }
-
-        setStatus('Fetching token…');
-        const res = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          setStatus(body.error || `Token request failed (${res.status})`, 'error');
-          console.error('Token endpoint returned', res.status, body);
-          return;
-        }
-        const { token, label, callerNumber } = await res.json();
-        document.title = `Dialer — ${label || IDENTITY}`;
-
-        if (typeof Twilio === 'undefined') {
-          setStatus('Twilio SDK failed to load (check network/CSP)', 'error');
-          return;
-        }
-
-        device = new Twilio.Device(token, {
-          codecPreferences: ['opus', 'pcmu'],
-        });
-
-        device.on('registered', () => {
-          setStatus(`Ready — ${label} (${callerNumber})`, 'ready');
-          setCallingUI(false);
-        });
-
-        device.on('error', (err) => {
-          console.error('Twilio Device error:', err);
-          setStatus(`Error: ${err.message}`, 'error');
-        });
-
-        // Refresh the token before it expires (tokens are minted with a 1hr TTL)
-        device.on('tokenWillExpire', async () => {
-          const r = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
-          const { token: newToken } = await r.json();
-          device.updateToken(newToken);
-        });
-
-        device.on('incoming', (call) => {
-          // If you enable inbound browser calls later, handle ringing UI here.
-          setStatus(`Incoming: ${call.parameters.From}`, 'active');
-          activeCall = call;
-          wireCallEvents(call);
-          call.accept(); // or show accept/reject buttons instead of auto-accept
-        });
-
-        await device.register();
-      } catch (err) {
-        console.error('initDevice failed:', err);
-        setStatus(`Setup failed: ${err.message}`, 'error');
-      }
-    }
-
-    function wireCallEvents(call) {
-      call.on('ringing', () => setStatus('Ringing…', 'active'));
-      call.on('accept', () => {
-        setStatus('On call', 'active');
-        setCallingUI(true);
-        keypadEl.classList.remove('hidden');
-      });
-      call.on('disconnect', () => {
-        setStatus('Ready', 'ready');
-        setCallingUI(false);
-        keypadEl.classList.add('hidden');
-        activeCall = null;
-      });
-      call.on('cancel', () => {
-        setStatus('Call canceled', 'ready');
-        setCallingUI(false);
-        keypadEl.classList.add('hidden');
-        activeCall = null;
-      });
-      call.on('reject', () => {
-        setStatus('Call rejected', 'ready');
-        setCallingUI(false);
-        keypadEl.classList.add('hidden');
-        activeCall = null;
-      });
-      call.on('error', (err) => {
-        console.error('Call error:', err);
-        setStatus(`Call error: ${err.message}`, 'error');
-        setCallingUI(false);
-        keypadEl.classList.add('hidden');
-        activeCall = null;
-      });
-    }
-
-    async function makeCall(numberOverride) {
-      if (!device) return;
-      const to = (numberOverride || numberEl.value).trim();
-      if (!to) return;
-
-      numberEl.value = to;
-      setStatus(`Calling ${to}…`, 'active');
-      activeCall = await device.connect({ params: { To: to } });
-      wireCallEvents(activeCall);
-    }
-
-    function hangUp() {
-      if (activeCall) activeCall.disconnect();
-    }
-
-    callBtn.addEventListener('click', () => makeCall());
-    hangupBtn.addEventListener('click', hangUp);
-    numberEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !callBtn.disabled) makeCall();
-    });
-
-    // ---------------------------------------------------------------
-    // CRM click-to-call hook
-    // ---------------------------------------------------------------
-    // From your CRM page (same origin), you can trigger a call directly:
-    //   document.getElementById('dialerFrame').contentWindow.dialerCall('+15551234567')
-    // if this page is embedded in an iframe, or just call window.dialerCall(...)
-    // if it's loaded in the same document/tab.
-    window.dialerCall = (number) => makeCall(number);
-
-    // ---------------------------------------------------------------
-    // Document Picture-in-Picture: pop the dialer into a floating window
-    // that stays on top while the rep works in the CRM tab.
-    // ---------------------------------------------------------------
-    const dialerEl = document.getElementById('dialer');
-    let pipWindow = null;
-
-    pipBtn.addEventListener('click', async () => {
-      if (!('documentPictureInPicture' in window)) {
-        alert('Floating window needs Chrome or Edge 116+. Not supported in this browser.');
-        return;
-      }
-      if (pipWindow) return; // already popped out
-
-      pipWindow = await window.documentPictureInPicture.requestWindow({
-        width: 300,
-        height: 260,
-      });
-
-      // Copy current stylesheets into the PiP window so it isn't unstyled
-      [...document.styleSheets].forEach((styleSheet) => {
-        try {
-          const cssText = [...styleSheet.cssRules].map((r) => r.cssText).join('\n');
-          const style = document.createElement('style');
-          style.textContent = cssText;
-          pipWindow.document.head.appendChild(style);
-        } catch (e) {
-          // Cross-origin stylesheet — link it instead
-          const link = document.createElement('link');
-          link.rel = 'stylesheet';
-          link.type = styleSheet.type;
-          link.media = styleSheet.media;
-          link.href = styleSheet.href;
-          pipWindow.document.head.appendChild(link);
-        }
-      });
-      pipWindow.document.body.style.margin = '0';
-      pipWindow.document.body.style.background = 'var(--bg)';
-
-      // Move the actual dialer DOM node into the PiP window.
-      // Note: this doesn't create a new JS context — `device`, `activeCall`,
-      // and all the event listeners above keep working exactly as before.
-      pipWindow.document.body.appendChild(dialerEl);
-      pipBtn.classList.add('hidden'); // pop-out button doesn't make sense once popped out
-
-      // When the user closes the PiP window, move the dialer back
-      pipWindow.addEventListener('pagehide', () => {
-        document.getElementById('app').appendChild(dialerEl);
-        pipBtn.classList.remove('hidden');
-        pipWindow = null;
-      });
-    });
-
-    // ---------------------------------------------------------------
-    // Airtable button integration: read ?number=+15551234567 from the URL
-    // (and optional &autodial=1 to skip the manual click).
-    // Airtable Button field formula example:
-    //   "https://your-dialer.app/dialer.html?identity=marc&number=" & ENCODE_URL_COMPONENT({Phone})
-    // ---------------------------------------------------------------
-    function applyUrlParams() {
-      const params = new URLSearchParams(location.search);
+    function runRelayMode() {
+      document.getElementById('dialer').classList.add('hidden');
+      document.getElementById('relayScreen').classList.remove('hidden');
+      const relayStatus = document.getElementById('relayStatus');
       const number = params.get('number');
       const autodial = params.get('autodial') === '1';
 
-      if (number) {
-        numberEl.value = number;
-        document.getElementById('autofillNote').classList.remove('hidden');
-
-        if (autodial) {
-          // Wait for the device to be ready before dialing automatically.
-          const tryAutoDial = setInterval(() => {
-            if (device && !callBtn.disabled) {
-              clearInterval(tryAutoDial);
-              makeCall(number);
-            }
-          }, 300);
-          // Give up after 10s so it doesn't spin forever if the device never registers
-          setTimeout(() => clearInterval(tryAutoDial), 10000);
-        }
+      if (!number || !dialChannel) {
+        relayStatus.textContent = 'Missing number or identity — check the Airtable button formula.';
+        return;
       }
+
+      dialChannel.postMessage({ type: 'dial', number, autodial });
+      relayStatus.textContent = `Sent ${number} to your dialer ✓`;
+
+      // Attempt to auto-close this tab. Browsers only allow script-closing
+      // tabs they opened themselves, so if this was opened as a normal link
+      // (which Airtable's button does), the close may silently fail — that's
+      // fine, the status message above tells the rep it's safe to close manually.
+      setTimeout(() => {
+        window.close();
+      }, 400);
     }
 
     // ---------------------------------------------------------------
-    initDevice();
-    applyUrlParams();
+    // Normal dialer mode (only runs if this tab is NOT in relay mode)
+    // ---------------------------------------------------------------
+    if (!isRelay) {
+
+      const statusEl = document.getElementById('status');
+      const numberEl = document.getElementById('number');
+      const callBtn = document.getElementById('callBtn');
+      const hangupBtn = document.getElementById('hangupBtn');
+      const pipBtn = document.getElementById('pipBtn');
+      const keypadEl = document.getElementById('keypad');
+
+      // ---------------------------------------------------------------
+      // DTMF (touch-tone) sending — for IVR menus like "press 1 for sales"
+      // ---------------------------------------------------------------
+      const VALID_DIGITS = new Set(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#']);
+
+      function sendDigit(digit, sourceBtn) {
+        if (!activeCall) return;
+        activeCall.sendDigits(digit);
+        if (sourceBtn) {
+          sourceBtn.classList.add('flash');
+          setTimeout(() => sourceBtn.classList.remove('flash'), 150);
+        }
+      }
+
+      document.querySelectorAll('.keypadBtn').forEach((btn) => {
+        btn.addEventListener('click', () => sendDigit(btn.dataset.digit, btn));
+      });
+
+      // Keyboard capture: while a call is active, typing a digit anywhere on the
+      // page (except while focused in the number input) sends that DTMF tone —
+      // no need to click anything, just type like you would on a real phone.
+      window.addEventListener('keydown', (e) => {
+        if (!activeCall) return;
+        if (document.activeElement === numberEl) return; // don't hijack typing a new number
+        if (!VALID_DIGITS.has(e.key)) return;
+
+        e.preventDefault();
+        const matchingBtn = document.querySelector(`.keypadBtn[data-digit="${e.key}"]`);
+        sendDigit(e.key, matchingBtn);
+      });
+
+      let device;
+      let activeCall;
+
+      function setStatus(text, mode) {
+        statusEl.textContent = text;
+        statusEl.className = mode || '';
+      }
+
+      function setCallingUI(inCall) {
+        callBtn.disabled = inCall || !device;
+        hangupBtn.disabled = !inCall;
+        numberEl.disabled = inCall;
+      }
+
+      // ---------------------------------------------------------------
+      // Twilio Device setup
+      // ---------------------------------------------------------------
+      async function initDevice() {
+        try {
+          if (!IDENTITY) {
+            setStatus('No identity in URL — add ?identity=yourname', 'error');
+            return;
+          }
+
+          setStatus('Fetching token…');
+          const res = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            setStatus(body.error || `Token request failed (${res.status})`, 'error');
+            console.error('Token endpoint returned', res.status, body);
+            return;
+          }
+          const { token, label, callerNumber } = await res.json();
+          document.title = `Dialer — ${label || IDENTITY}`;
+
+          if (typeof Twilio === 'undefined') {
+            setStatus('Twilio SDK failed to load (check network/CSP)', 'error');
+            return;
+          }
+
+          device = new Twilio.Device(token, {
+            codecPreferences: ['opus', 'pcmu'],
+          });
+
+          device.on('registered', () => {
+            setStatus(`Ready — ${label} (${callerNumber})`, 'ready');
+            setCallingUI(false);
+          });
+
+          device.on('error', (err) => {
+            console.error('Twilio Device error:', err);
+            setStatus(`Error: ${err.message}`, 'error');
+          });
+
+          // Refresh the token before it expires (tokens are minted with a 1hr TTL)
+          device.on('tokenWillExpire', async () => {
+            const r = await fetch(`/token?identity=${encodeURIComponent(IDENTITY)}`);
+            const { token: newToken } = await r.json();
+            device.updateToken(newToken);
+          });
+
+          device.on('incoming', (call) => {
+            // If you enable inbound browser calls later, handle ringing UI here.
+            setStatus(`Incoming: ${call.parameters.From}`, 'active');
+            activeCall = call;
+            wireCallEvents(call);
+            call.accept(); // or show accept/reject buttons instead of auto-accept
+          });
+
+          await device.register();
+        } catch (err) {
+          console.error('initDevice failed:', err);
+          setStatus(`Setup failed: ${err.message}`, 'error');
+        }
+      }
+
+      function wireCallEvents(call) {
+        call.on('ringing', () => setStatus('Ringing…', 'active'));
+        call.on('accept', () => {
+          setStatus('On call', 'active');
+          setCallingUI(true);
+          keypadEl.classList.remove('hidden');
+        });
+        call.on('disconnect', () => {
+          setStatus('Ready', 'ready');
+          setCallingUI(false);
+          keypadEl.classList.add('hidden');
+          activeCall = null;
+        });
+        call.on('cancel', () => {
+          setStatus('Call canceled', 'ready');
+          setCallingUI(false);
+          keypadEl.classList.add('hidden');
+          activeCall = null;
+        });
+        call.on('reject', () => {
+          setStatus('Call rejected', 'ready');
+          setCallingUI(false);
+          keypadEl.classList.add('hidden');
+          activeCall = null;
+        });
+        call.on('error', (err) => {
+          console.error('Call error:', err);
+          setStatus(`Call error: ${err.message}`, 'error');
+          setCallingUI(false);
+          keypadEl.classList.add('hidden');
+          activeCall = null;
+        });
+      }
+
+      async function makeCall(numberOverride) {
+        if (!device) return;
+        const to = (numberOverride || numberEl.value).trim();
+        if (!to) return;
+
+        numberEl.value = to;
+        setStatus(`Calling ${to}…`, 'active');
+        activeCall = await device.connect({ params: { To: to } });
+        wireCallEvents(activeCall);
+      }
+
+      function hangUp() {
+        if (activeCall) activeCall.disconnect();
+      }
+
+      callBtn.addEventListener('click', () => makeCall());
+      hangupBtn.addEventListener('click', hangUp);
+      numberEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !callBtn.disabled) makeCall();
+      });
+
+      // ---------------------------------------------------------------
+      // CRM click-to-call hook
+      // ---------------------------------------------------------------
+      // From your CRM page (same origin), you can trigger a call directly:
+      //   document.getElementById('dialerFrame').contentWindow.dialerCall('+15551234567')
+      // if this page is embedded in an iframe, or just call window.dialerCall(...)
+      // if it's loaded in the same document/tab.
+      window.dialerCall = (number) => makeCall(number);
+
+      // ---------------------------------------------------------------
+      // Document Picture-in-Picture: pop the dialer into a floating window
+      // that stays on top while the rep works in the CRM tab.
+      // ---------------------------------------------------------------
+      const dialerEl = document.getElementById('dialer');
+      let pipWindow = null;
+
+      pipBtn.addEventListener('click', async () => {
+        if (!('documentPictureInPicture' in window)) {
+          alert('Floating window needs Chrome or Edge 116+. Not supported in this browser.');
+          return;
+        }
+        if (pipWindow) return; // already popped out
+
+        pipWindow = await window.documentPictureInPicture.requestWindow({
+          width: 300,
+          height: 260,
+        });
+
+        // Copy current stylesheets into the PiP window so it isn't unstyled
+        [...document.styleSheets].forEach((styleSheet) => {
+          try {
+            const cssText = [...styleSheet.cssRules].map((r) => r.cssText).join('\n');
+            const style = document.createElement('style');
+            style.textContent = cssText;
+            pipWindow.document.head.appendChild(style);
+          } catch (e) {
+            // Cross-origin stylesheet — link it instead
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.type = styleSheet.type;
+            link.media = styleSheet.media;
+            link.href = styleSheet.href;
+            pipWindow.document.head.appendChild(link);
+          }
+        });
+        pipWindow.document.body.style.margin = '0';
+        pipWindow.document.body.style.background = 'var(--bg)';
+
+        // Move the actual dialer DOM node into the PiP window.
+        // Note: this doesn't create a new JS context — `device`, `activeCall`,
+        // and all the event listeners above keep working exactly as before.
+        pipWindow.document.body.appendChild(dialerEl);
+        pipBtn.classList.add('hidden'); // pop-out button doesn't make sense once popped out
+
+        // When the user closes the PiP window, move the dialer back
+        pipWindow.addEventListener('pagehide', () => {
+          document.getElementById('app').appendChild(dialerEl);
+          pipBtn.classList.remove('hidden');
+          pipWindow = null;
+        });
+      });
+
+      // ---------------------------------------------------------------
+      // Airtable button integration: read ?number=+15551234567 from the URL
+      // (and optional &autodial=1 to skip the manual click).
+      // Airtable Button field formula example:
+      //   "https://your-dialer.app/dialer.html?identity=marc&number=" & ENCODE_URL_COMPONENT({Phone})
+      // ---------------------------------------------------------------
+      function applyUrlParams() {
+        const params = new URLSearchParams(location.search);
+        const number = params.get('number');
+        const autodial = params.get('autodial') === '1';
+
+        if (number) {
+          numberEl.value = number;
+          document.getElementById('autofillNote').classList.remove('hidden');
+
+          if (autodial) {
+            // Wait for the device to be ready before dialing automatically.
+            const tryAutoDial = setInterval(() => {
+              if (device && !callBtn.disabled) {
+                clearInterval(tryAutoDial);
+                makeCall(number);
+              }
+            }, 300);
+            // Give up after 10s so it doesn't spin forever if the device never registers
+            setTimeout(() => clearInterval(tryAutoDial), 10000);
+          }
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // Receive numbers relayed from an Airtable-launched tab (see runRelayMode
+      // above). This is what makes clicking a lead's number in Airtable fill
+      // the number here — in whichever window this dialer currently is,
+      // including a popped-out PiP window — instead of opening a second dialer.
+      // ---------------------------------------------------------------
+      if (dialChannel) {
+        dialChannel.onmessage = (event) => {
+          const { type, number, autodial } = event.data || {};
+          if (type !== 'dial' || !number) return;
+
+          numberEl.value = number;
+          document.getElementById('autofillNote').classList.remove('hidden');
+
+          if (autodial && device && !callBtn.disabled) {
+            makeCall(number);
+          }
+        };
+      }
+
+      // ---------------------------------------------------------------
+      initDevice();
+      applyUrlParams();
+
+    } // end normal dialer mode (isRelay check)
   </script>
 </body>
 
