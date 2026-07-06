@@ -12,18 +12,30 @@ const {
   API_KEY_SID,
   API_KEY_SECRET,
   TWIML_APP_SID,
-  TWILIO_NUMBER,
   PORT = 3000,
 } = process.env;
 
 // Fail loudly at boot if config is missing — better than a cryptic 500 later
-const required = { ACCOUNT_SID, API_KEY_SID, API_KEY_SECRET, TWIML_APP_SID, TWILIO_NUMBER };
+const required = { ACCOUNT_SID, API_KEY_SID, API_KEY_SECRET, TWIML_APP_SID };
 const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
 if (missing.length) {
   console.error(`Missing required env vars: ${missing.join(', ')}`);
   console.error('Copy .env.example to .env and fill it in.');
   process.exit(1);
 }
+
+// Per-rep caller number lookup. Each identity gets its own outbound
+// Caller ID. Edit callers.json to add/remove reps or swap in real numbers —
+// no code changes needed, just a redeploy.
+let callers;
+try {
+  callers = require('./callers.json');
+} catch (e) {
+  console.error('Could not load callers.json — see callers.json.example for format.');
+  process.exit(1);
+}
+
+const validIdentities = new Set(Object.keys(callers));
 
 const app = express();
 app.use(express.json());
@@ -38,7 +50,13 @@ app.use(express.static(path.join(__dirname, 'public')));
  * and call logs can be told apart in Twilio.
  */
 app.get('/token', (req, res) => {
-  const identity = (req.query.identity || 'agent').replace(/[^a-zA-Z0-9_.-]/g, '');
+  const identity = (req.query.identity || '').replace(/[^a-zA-Z0-9_.-]/g, '');
+
+  if (!validIdentities.has(identity)) {
+    return res.status(400).json({
+      error: `Unknown identity "${identity}". Check callers.json for valid identities.`,
+    });
+  }
 
   const voiceGrant = new VoiceGrant({
     outgoingApplicationSid: TWIML_APP_SID,
@@ -51,7 +69,12 @@ app.get('/token', (req, res) => {
   });
   token.addGrant(voiceGrant);
 
-  res.json({ token: token.toJwt(), identity });
+  res.json({
+    token: token.toJwt(),
+    identity,
+    label: callers[identity].label,
+    callerNumber: callers[identity].number,
+  });
 });
 
 /**
@@ -63,12 +86,25 @@ app.post('/voice', (req, res) => {
   const twiml = new VoiceResponse();
   const to = (req.body.To || '').trim();
 
+  // When the browser SDK places a call, Twilio's request here includes
+  // From = "client:<identity>" — that's how we know which rep is calling
+  // and therefore which of their numbers to show as the Caller ID.
+  const rawFrom = req.body.From || '';
+  const callingIdentity = rawFrom.replace(/^client:/, '');
+  const callerRecord = callers[callingIdentity];
+
+  if (!callerRecord) {
+    console.error(`Unknown calling identity: "${callingIdentity}"`);
+    twiml.say('Your caller identity was not recognized. Contact your admin.');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
   if (!to) {
     twiml.say('No destination number was provided.');
     return res.type('text/xml').send(twiml.toString());
   }
 
-  const dial = twiml.dial({ callerId: TWILIO_NUMBER });
+  const dial = twiml.dial({ callerId: callerRecord.number });
 
   // Basic guard: if it looks like a phone number, dial PSTN.
   // Otherwise treat it as a client identity (browser-to-browser call).
