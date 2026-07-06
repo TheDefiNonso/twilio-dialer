@@ -1,0 +1,18 @@
+{
+  "marc": {
+    "label": "Marc",
+    "number": "+15550000001"
+  },
+  "rep2": {
+    "label": "Rep 2 — replace with real name",
+    "number": "+15550000002"
+  },
+  "rep3": {
+    "label": "Rep 3 — replace with real name",
+    "number": "+15550000003"
+  },
+  "rep4": {
+    "label": "Rep 4 — replace with real name",
+    "number": "+15550000004"
+  }
+}
