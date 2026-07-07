@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8" />
-  <title>Maplelock CRM Dialer</title>
+  <title>CRM Dialer</title>
   <script src="/twilio.min.js"></script>
   <style>
     :root {
@@ -213,6 +213,24 @@
     // ---------------------------------------------------------------
     const IDENTITY = new URLSearchParams(location.search).get('identity') || '';
 
+    /**
+     * Mirrors the backend's normalizePhoneNumber logic, purely for display —
+     * so the input box shows the clean number that will actually be dialed,
+     * instead of raw Airtable text like "905-764-9166 ext:52". The backend
+     * still does its own authoritative normalization at call time regardless.
+     */
+    function normalizePhoneDisplay(raw) {
+      if (!raw) return raw;
+      const withoutExtension = raw.split(/ext\.?:?\s*\d*/i)[0];
+      let digits = withoutExtension.replace(/\D/g, '');
+      if (digits.length === 11 && digits.startsWith('1')) {
+        digits = digits.slice(1);
+      }
+      digits = digits.slice(0, 10);
+      if (digits.length !== 10) return raw; // couldn't confidently clean — show original rather than hide it
+      return `+1${digits}`;
+    }
+
     // Same-origin tabs/windows for the same rep can talk to each other over
     // this channel. Used so an Airtable-launched tab can hand a number off
     // to an already-open dialer (including a popped-out PiP window) instead
@@ -254,7 +272,7 @@
         const data = event.data || {};
         if (data.type === 'ack' && data.requestId === requestId) {
           acked = true;
-          relayStatus.textContent = `Sent ${number} to your open dialer ✓`;
+          relayStatus.textContent = `Sent ${normalizePhoneDisplay(number)} to your open dialer ✓`;
           setTimeout(() => window.close(), 400);
         }
       };
@@ -518,10 +536,11 @@
       // ---------------------------------------------------------------
       function applyUrlParams() {
         const params = new URLSearchParams(location.search);
-        const number = params.get('number');
+        const rawNumber = params.get('number');
         const autodial = params.get('autodial') === '1';
 
-        if (number) {
+        if (rawNumber) {
+          const number = normalizePhoneDisplay(rawNumber);
           numberEl.value = number;
           document.getElementById('autofillNote').classList.remove('hidden');
 
@@ -554,11 +573,12 @@
           // knows a live dialer caught this and it's safe to close itself.
           dialChannel.postMessage({ type: 'ack', requestId });
 
-          numberEl.value = number;
+          const cleanNumber = normalizePhoneDisplay(number);
+          numberEl.value = cleanNumber;
           document.getElementById('autofillNote').classList.remove('hidden');
 
           if (autodial && device && !callBtn.disabled) {
-            makeCall(number);
+            makeCall(cleanNumber);
           }
         };
       }
