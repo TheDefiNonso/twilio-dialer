@@ -37,6 +37,37 @@ try {
 
 const validIdentities = new Set(Object.keys(callers));
 
+/**
+ * Cleans up messy phone numbers into strict E.164 (+1XXXXXXXXXX) format.
+ * Handles cases like "905-764-9166 ext:52" by cutting everything from
+ * "ext" onward, stripping all punctuation, and capping to exactly 10
+ * digits after an optional leading US country code.
+ * Returns null if it can't confidently produce a valid 10-digit number.
+ */
+function normalizePhoneNumber(raw) {
+  if (!raw) return null;
+
+  // Cut off anything from "ext"/"ext."/"ext:" onward, case-insensitive
+  // (e.g. "905-764-9166 ext:52" -> "905-764-9166 ")
+  const withoutExtension = raw.split(/ext\.?:?\s*\d*/i)[0];
+
+  // Strip everything except digits
+  let digits = withoutExtension.replace(/\D/g, '');
+
+  // Drop a leading US country code if present (11 digits starting with 1)
+  if (digits.length === 11 && digits.startsWith('1')) {
+    digits = digits.slice(1);
+  }
+
+  // Cap at exactly 10 digits — anything beyond this (stray extension
+  // digits, typos) is dropped rather than dialed
+  digits = digits.slice(0, 10);
+
+  if (digits.length !== 10) return null; // not enough to confidently dial
+
+  return `+1${digits}`;
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false })); // Twilio posts form-urlencoded to /voice
@@ -106,10 +137,19 @@ app.post('/voice', (req, res) => {
 
   const dial = twiml.dial({ callerId: callerRecord.number });
 
-  // Basic guard: if it looks like a phone number, dial PSTN.
-  // Otherwise treat it as a client identity (browser-to-browser call).
-  if (/^[\d+\-().\s]+$/.test(to)) {
-    dial.number(to);
+  // Treat anything with typical phone punctuation OR an "ext" marker as a
+  // phone number to normalize. Otherwise, treat it as a client identity
+  // (browser-to-browser call).
+  const looksLikePhoneNumber = /ext/i.test(to) || /^[\d+\-().\s]+$/.test(to);
+
+  if (looksLikePhoneNumber) {
+    const normalized = normalizePhoneNumber(to);
+    if (!normalized) {
+      console.error(`Could not normalize number: "${to}"`);
+      twiml.say('The destination number could not be understood. Please check it and try again.');
+      return res.type('text/xml').send(twiml.toString());
+    }
+    dial.number(normalized);
   } else {
     dial.client(to);
   }

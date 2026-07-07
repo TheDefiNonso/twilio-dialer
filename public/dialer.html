@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8" />
-  <title>CRM Dialer</title>
+  <title>Maplelock CRM Dialer</title>
   <script src="/twilio.min.js"></script>
   <style>
     :root {
@@ -230,6 +230,8 @@
 
     if (isRelay) {
       runRelayMode();
+    } else {
+      startNormalDialer();
     }
 
     function runRelayMode() {
@@ -244,22 +246,38 @@
         return;
       }
 
-      dialChannel.postMessage({ type: 'dial', number, autodial });
-      relayStatus.textContent = `Sent ${number} to your dialer ✓`;
+      const requestId = Math.random().toString(36).slice(2);
+      let acked = false;
 
-      // Attempt to auto-close this tab. Browsers only allow script-closing
-      // tabs they opened themselves, so if this was opened as a normal link
-      // (which Airtable's button does), the close may silently fail — that's
-      // fine, the status message above tells the rep it's safe to close manually.
+      // Listen for an ack from a live dialer confirming it caught the number
+      dialChannel.onmessage = (event) => {
+        const data = event.data || {};
+        if (data.type === 'ack' && data.requestId === requestId) {
+          acked = true;
+          relayStatus.textContent = `Sent ${number} to your open dialer ✓`;
+          setTimeout(() => window.close(), 400);
+        }
+      };
+
+      dialChannel.postMessage({ type: 'dial', requestId, number, autodial });
+
+      // If nothing acknowledges quickly, no dialer is currently open anywhere —
+      // become the dialer right here in this tab instead of leaving a dead end.
       setTimeout(() => {
-        window.close();
-      }, 400);
+        if (!acked) {
+          relayStatus.textContent = 'No dialer open — starting one here…';
+          document.getElementById('relayScreen').classList.add('hidden');
+          document.getElementById('dialer').classList.remove('hidden');
+          startNormalDialer();
+        }
+      }, 500);
     }
 
     // ---------------------------------------------------------------
-    // Normal dialer mode (only runs if this tab is NOT in relay mode)
+    // Normal dialer mode — runs immediately for a direct visit, or as a
+    // fallback from relay mode when no existing dialer was found to answer.
     // ---------------------------------------------------------------
-    if (!isRelay) {
+    function startNormalDialer() {
 
       const statusEl = document.getElementById('status');
       const numberEl = document.getElementById('number');
@@ -529,8 +547,12 @@
       // ---------------------------------------------------------------
       if (dialChannel) {
         dialChannel.onmessage = (event) => {
-          const { type, number, autodial } = event.data || {};
+          const { type, requestId, number, autodial } = event.data || {};
           if (type !== 'dial' || !number) return;
+
+          // Confirm receipt so the relay tab (or any other dialer instance)
+          // knows a live dialer caught this and it's safe to close itself.
+          dialChannel.postMessage({ type: 'ack', requestId });
 
           numberEl.value = number;
           document.getElementById('autofillNote').classList.remove('hidden');
@@ -545,7 +567,7 @@
       initDevice();
       applyUrlParams();
 
-    } // end normal dialer mode (isRelay check)
+    } // end startNormalDialer
   </script>
 </body>
 
